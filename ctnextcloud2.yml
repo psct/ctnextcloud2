@@ -1,0 +1,120 @@
+version: "3.7"
+
+services:
+
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    hostname: traefik
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - ./traefik/static.yml:/etc/traefik/traefik.yml
+      - ./traefik/acme.json:/etc/traefik/acme/acme.json
+      - ./traefik/dynamic:/etc/traefik/dynamic
+    command:
+      - "--certificatesresolvers.myresolver.acme.email=${YOUR_MAIL}"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    hostname: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  db_nextcloud:
+    image: mariadb:10
+    restart: always
+    container_name: db_nextcloud
+    hostname: db_nextcloud
+    volumes:
+      - ./data/db_nextcloud:/var/lib/mysql
+    command: --innodb-read-only-compressed=OFF
+    environment:
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD}
+
+  nextcloud:
+# as of Sep/2021 version 22 does not work, see 
+# https://github.com/nextcloud/server/issues/28261
+    image: nextcloud:21
+    container_name: nextcloud
+    hostname: nextcloud
+    restart: always
+    depends_on:
+      - db_nextcloud
+    volumes:
+      - ./data/nextcloud/www:/var/www/html
+      - ./data/nextcloud/config:/var/www/html/config
+      - ./data/nextcloud/custom_apps:/var/www/html/custom_apps
+      - ./data/nextcloud/themes:/var/www/html/themes
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_HOST=db_nextcloud
+      - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER}
+      - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD}
+      - NEXTCLOUD_TRUSTED_DOMAINS="${NEXTCLOUD_HOST}"
+#!!! fixme
+      - TRUSTED_PROXIES="172.16.0.0/12,192.168.0.0/16,fd:100::/64"
+      - OVERWRITEPROTOCOL=https
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.nextcloud.rule=Host(`${NEXTCLOUD_HOST}`)
+      - traefik.http.routers.nextcloud.tls.certResolver=le
+      - traefik.http.routers.nextcloud.middlewares=nextcloudheaders@docker,nextcloud-dav@docker
+      - traefik.http.middlewares.nextcloudheaders.headers.customRequestHeaders.X-Forwarded-Proto=https
+      - traefik.http.middlewares.nextcloudheaders.headers.accessControlAllowOriginList=*
+      - traefik.http.middlewares.nextcloud-dav.replacepathregex.regex=^/.well-known/ca(l|rd)dav
+      - traefik.http.middlewares.nextcloud-dav.replacepathregex.replacement=/remote.php/dav/
+
+  mongo:
+    image: mongo:3.6
+    restart: unless-stopped
+    command: mongod --smallfiles --oplogSize 128 --replSet rs0
+    volumes:
+      - ./data/rocket_mongo_db:/data/db
+      - ./data/rocket_mongo_backups:/dump
+
+  mongo-init-replica:
+    image: mongo:3.6
+    command: 'mongo mongo/rocketchat --eval "rs.initiate({ _id: ''rs0'', members: [ { _id: 0, host: ''localhost:27017'' } ]})"'
+    depends_on:
+      - mongo
+
+  rocketchat:
+    image: registry.rocket.chat/rocketchat/rocket.chat:latest
+    restart: unless-stopped
+    command: /bin/sh -c 'INSTANCE_IP=$$(hostname -i) node main.js'
+    volumes:
+     - ./data/rocket_uploads:/app/uploads
+# must be mounted with sticky bit or docker volume
+     - /tmp:/tmp
+    environment:
+     - PORT=3000
+     - ROOT_URL=https://${ROCKETCHAT_HOST}
+     - MONGO_URL=mongodb://mongo:27017/rocketchat
+     - MONGO_OPLOG_URL=mongodb://mongo:27017/local
+     - ADMIN_USERNAME=${ROCKETCHAT_ADMIN_USER}
+     - ADMIN_PASS=${ROCKETCHAT_ADMIN_PASSWORD}
+     - ADMIN_EMAIL=${ROCKETCHAT_ADMIN_MAIL}
+    depends_on:
+      - mongo
+      - traefik
+    expose:
+      - "3000"
+    labels:
+      - traefik.enable=true
+      - traefik.http.services.rocketchat.loadbalancer.server.port=3000
+      - traefik.http.routers.rocketchat.rule=Host(`${ROCKETCHAT_HOST}`)
+      - traefik.http.routers.rocketchat.tls.certResolver=le
+
